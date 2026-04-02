@@ -1,6 +1,7 @@
 import os
 import json
 import time
+from argparse import Namespace
 
 from data_utils import construct_instrs
 from utils.logger import write_to_record_file
@@ -37,14 +38,32 @@ def valid(args, val_envs):
     agent = NavAgent(next(iter(val_envs.values())), args)
 
     with open(os.path.join(args.log_dir, 'validation_args.json'), 'w') as outf:
-        json.dump(vars(args), outf, indent=4)
+        _args = vars(args).copy()
+        if _args.get('api_key'):
+            _args['api_key'] = '***'
+        json.dump(_args, outf, indent=4)
     record_file = os.path.join(args.log_dir, 'valid.txt')
-    write_to_record_file(str(args) + '\n\n', record_file)
+    _log = vars(args).copy()
+    if _log.get('api_key'):
+        _log['api_key'] = '***'
+    write_to_record_file(str(Namespace(**_log)) + '\n\n', record_file)
 
     for env_name, env in val_envs.items():
         prefix = 'submit'
-        if os.path.exists(os.path.join(args.pred_dir, "%s_%s.json" % (prefix, env_name))):
-            continue
+        submit_path = os.path.join(args.pred_dir, "%s_%s.json" % (prefix, env_name))
+        if os.path.exists(submit_path):
+            try:
+                with open(submit_path) as sf:
+                    submit_preds = json.load(sf)
+                full_n = (
+                    env.full_dataset_size()
+                    if hasattr(env, 'full_dataset_size')
+                    else env.size()
+                )
+                if isinstance(submit_preds, list) and len(submit_preds) >= full_n:
+                    continue
+            except (json.JSONDecodeError, OSError):
+                pass
         agent.env = env
 
         start_time = time.time()

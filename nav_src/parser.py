@@ -1,6 +1,18 @@
 import argparse
 import os
 
+# ---------------------------------------------------------------------------
+# OpenAI 兼容 HTTP 接口（百炼 / OpenAI / OpenRouter / 其它兼容网关）
+# 换平台时只改下面三项即可；也可用命令行 --api_key / --api_base 覆盖。
+# 留空则走环境变量 OPENAI_API_KEY、OPENAI_API_BASE（可选）。
+# ---------------------------------------------------------------------------
+OPENAI_COMPAT_API_KEY = ""
+OPENAI_COMPAT_API_BASE = ""
+# 示例 base：
+#   https://api.openai.com/v1
+#   https://dashscope.aliyuncs.com/compatible-mode/v1
+#   https://openrouter.ai/api/v1
+
 
 def parse_args():
     parser = argparse.ArgumentParser(description="")
@@ -14,7 +26,15 @@ def parse_args():
 
     # Agent
     parser.add_argument('--temperature', type=float, default=0.0, help='temperature for llm')
-    parser.add_argument('--llm_model_name', type=str, default='gpt-3.5-turbo', help='llm model name')
+    parser.add_argument('--llm_model_name', type=str, default='app-cwtopb-1764155124595787091', help='llm model name')
+    parser.add_argument(
+        '--api_key', type=str, default='',
+        help='OpenAI-compatible API key; empty uses OPENAI_COMPAT_API_KEY in parser.py or env',
+    )
+    parser.add_argument(
+        '--api_base', type=str, default='',
+        help='OpenAI-compatible base URL (must end with /v1); empty uses code constant or env',
+    )
     # parser.add_argument('--llm_model_name', type=str, default='gpt-4', help='llm model name')
     # parser.add_argument('--llm_model_name', type=str, default='LlaMA-2-13b', help='llm model name')
     parser.add_argument('--batch_size', type=int, default=1)
@@ -74,6 +94,21 @@ def postprocess_args(args):
     os.makedirs(args.output_dir, exist_ok=True)
     os.makedirs(args.log_dir, exist_ok=True)
     os.makedirs(args.pred_dir, exist_ok=True)
+
+    def _nv(s):
+        s = (s or '').strip()
+        return s or None
+
+    key = _nv(args.api_key) or _nv(OPENAI_COMPAT_API_KEY)
+    if not key:
+        key = _nv(os.environ.get('OPENAI_API_KEY')) or _nv(
+            os.environ.get('DASHSCOPE_API_KEY')
+        )
+    base = _nv(args.api_base) or _nv(OPENAI_COMPAT_API_BASE)
+    if not base:
+        base = _nv(os.environ.get('OPENAI_API_BASE'))
+    args.api_key = key
+    args.api_base = base
 
     return args
 

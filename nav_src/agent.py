@@ -1,5 +1,7 @@
 """Agent that interacts with Matterport3D simulator via a hierarchical planning approach."""
+import copy
 import json
+import os
 import yaml
 import re
 import warnings
@@ -15,7 +17,7 @@ from langchain.agents.agent import AgentExecutor, AgentAction, AgentOutputParser
 from langchain.agents.mrkl.base import ZeroShotAgent
 from langchain.agents.tools import Tool
 from langchain.chains import LLMChain
-from langchain.llms.openai import OpenAI
+from langchain.chat_models import ChatOpenAI
 from langchain.prompts import PromptTemplate
 from langchain.schema import (
     AgentAction,
@@ -157,12 +159,7 @@ class NavAgent(BaseAgent):
         super().__init__(env)
         self.config = config
 
-        if config.llm_model_name.split('-')[0] == 'gpt':
-            self.llm = OpenAI(
-                temperature=config.temperature,
-                model_name=config.llm_model_name,
-            )
-        elif config.llm_model_name == 'llama-2-13b':
+        if config.llm_model_name == 'llama-2-13b':
             from LLMs.Langchain_llama import Custom_Llama
             ckpt_dir = "LLMs/llama/llama-2-13b"
             tokenizer_path = "LLMs/llama/tokenizer.model"
@@ -174,6 +171,23 @@ class NavAgent(BaseAgent):
                 max_gen_len = 500,
                 max_batch_size = 1,
             )
+        else:
+            _key = getattr(config, "api_key", None) or os.environ.get(
+                "OPENAI_API_KEY"
+            ) or os.environ.get("DASHSCOPE_API_KEY")
+            _base = getattr(config, "api_base", None) or os.environ.get(
+                "OPENAI_API_BASE"
+            )
+            _kw = {
+                "temperature": config.temperature,
+                "model_name": config.llm_model_name,
+                "max_retries": 100,
+            }
+            if _key:
+                _kw["openai_api_key"] = _key
+            if _base:
+                _kw["openai_api_base"] = _base.rstrip("/")
+            self.llm = ChatOpenAI(**_kw)
         # elif config.llm_model_name == 'Vicuna-v1.5-13b':
         #     from LLMs.Langchain_Vicuna import Custom_Vicuna
         #     self.llm = Custom_Vicuna.from_config(
@@ -662,20 +676,21 @@ class NavAgent(BaseAgent):
         # Initialize the trajectory
         self.init_trajecotry(obs)
 
-        # Load the instruction
         instructions = [ob['instruction'] for ob in obs]
-        if self.config.load_instruction:
-            action_plans = instructions
-        elif self.config.load_action_plan:
-            action_plans = [ob['action_plan'] for ob in obs]
-        else:
-            action_plans = []
-            for instruction in instructions:
-                action_plan = self.plan_chain.run(instruction = instruction)
-                action_plans.append(action_plan)
 
         for i, init_ob in enumerate(obs):
-            self.cur_action_plan = action_plans[i]
+            iid = init_ob['instr_id']
+            if iid in self.results:
+                self.traj[i] = copy.deepcopy(self.results[iid])
+                continue
+
+            if self.config.load_instruction:
+                self.cur_action_plan = instructions[i]
+            elif self.config.load_action_plan:
+                self.cur_action_plan = init_ob['action_plan']
+            else:
+                self.cur_action_plan = self.plan_chain.run(instruction=instructions[i])
+
             # Take the first action
             if self.config.use_tool_chain:
                 first_obs = self.action_maker('')

@@ -2,6 +2,7 @@
 
 import json
 import os
+import secrets
 import numpy as np
 import random
 import networkx as nx
@@ -135,6 +136,7 @@ class R2RNavBatch(object):
     ):
         self.env = EnvBatch(navigable_dir, feat_db=view_db, batch_size=batch_size)
         self.data = instr_data
+        self._dataset_size = len(self.data)
         self.scans = set([x['scan'] for x in self.data])
         self.connectivity_dir = connectivity_dir
         self.batch_size = batch_size
@@ -163,6 +165,32 @@ class R2RNavBatch(object):
 
     def size(self):
         return len(self.data)
+
+    def full_dataset_size(self):
+        """Original split size (before resume filtering); use for submit completeness checks."""
+        return self._dataset_size
+
+    def restrict_to_pending(self, completed_instr_ids):
+        """Drop completed episodes from the iteration queue and shuffle the rest.
+
+        Does not depend on matching the seed from an earlier run: any completed
+        instr_id is removed, remaining items are re-shuffled with the current RNG.
+        """
+        if not completed_instr_ids:
+            return
+        done = set(completed_instr_ids)
+        pending = [x for x in self.data if x['instr_id'] not in done]
+        if not pending:
+            self.data = []
+            self.ix = 0
+            return
+        if len(pending) == len(self.data):
+            return
+        self.data = pending
+        # Fresh order each resume; does not need to match the seed from an earlier run.
+        random.seed(secrets.randbits(64))
+        random.shuffle(self.data)
+        self.ix = 0
 
     def _load_nav_graphs(self):
         """
