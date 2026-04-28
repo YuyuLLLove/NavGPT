@@ -54,6 +54,44 @@ Previous action: {previous_action}
 Observation: {observation}
 Update history with the new observation:"""
 
+HISTORY_COMPRESS_PROMPT = """You are an agent that compresses navigation history for long-horizon indoor navigation.
+
+You will receive:
+1) The action plan.
+2) Previous steps in chronological order.
+3) The latest step that was just added.
+4) A rule to keep recent steps uncompressed.
+
+Goal:
+- Compress only old steps while preserving key landmarks, directional transitions, and progress against the action plan.
+- Never compress the most recent {keep_recent_steps} steps.
+- Keep the output concise and factual.
+
+Output requirements:
+- Return JSON only, with no extra text.
+- JSON schema:
+{{
+  "compress_range": [start_step, ..., end_step],
+  "compress_text": "summary of compressed steps"
+}}
+
+Rules:
+- If there is nothing safe to compress, return:
+{{"compress_range": [], "compress_text": ""}}
+- compress_range must be continuous and refer to existing step IDs.
+- compress_text must be grounded in the given steps only.
+
+Action plan:
+{action_plan}
+
+Previous steps:
+{previous_steps}
+
+Latest step:
+{new_step}
+
+JSON:"""
+
 MAKE_ACTION_TOOL_NAME = "action_maker"
 MAKE_ACTION_TOOL_DESCRIPTION = f'Can be used to move to next adjacent viewpoint.\nThe input to this tool should be a viewpoint ID string of the next viewpoint you wish to visit. For example:\nAction: action_maker\nAction Input: "4a153b13a3f6424784cb8e5dabbb3a2c".'
 
@@ -162,6 +200,8 @@ Begin!
 
 Instruction: {action_plan}
 Initial Observation: {init_observation}
+Navigation History:
+{navigation_history}
 Thought: I should start navigation according to the instruction, {agent_scratchpad}"""
 
 VLN_ORCHESTRATOR_PROMPT = """You are an agent that follows an instruction to navigate in indoor environment. You are required to make sequential decisions according to the observation of the environment to follow the given instruction.
@@ -201,6 +241,8 @@ Begin!
 
 Instruction: {action_plan}
 Initial Observation: {init_observation}
+Navigation History:
+{navigation_history}
 Thought: I should start navigation according to the instruction, {agent_scratchpad}"""
 
 VLN_GPT4_PROMPT = """You are an intelligent embodied agent that follows an instruction to navigate in an indoor environment. Your task is to move among the static viewpoints (positions) of a pre-defined graph of the environment, and try to reach the target viewpoint as described by the given instruction with the least steps. 
@@ -213,6 +255,11 @@ You make actions by selecting navigable viewpoints to reach the destination. You
 At each step, you should consider:
 (1) According to Current Viewpoint observation and History, have you reached the destination?
 If yes you should stop, output the 'Final Answer: Finished!' to stop.
+Use a strict stopping rule:
+- Stop only when the current viewpoint itself matches the final destination described in the instruction.
+- Do not stop just because you are in the correct room/area; stop only if the local landmark or final relation in the instruction is satisfied (for example, next to the massage table, in the bathroom, at the bottom of the stairs, inside the doorway, by the desk).
+- If the target room/object/landmark is visible but you are not yet clearly at the final position, continue moving closer.
+- If you have only completed an intermediate subgoal (for example entered the bedroom, passed the table, reached the hallway, or arrived near an entryway), do not stop yet.
 If not you should continue:
     (2) Consider where you are on the trajectory and what should be the next viewpoint to navigate according to the instruction.
     use the action_maker tool, input the next navigable viewpoint ID to move to that location.
@@ -242,6 +289,8 @@ Begin!
 
 Instruction: {action_plan}
 Initial Observation: {init_observation}
+Navigation History:
+{navigation_history}
 Thought: I should start navigation according to the instruction, {agent_scratchpad}"""
 
 VLN_GPT35_PROMPT = """As an intelligent embodied agent, you will navigate an indoor environment to reach a target viewpoint based on a given instruction, performing the Vision and Language Navigation (VLN) task. You'll move among static positions within a pre-defined graph, aiming for minimal steps.
@@ -252,6 +301,11 @@ Explore the environment while avoiding revisiting viewpoints by comparing curren
 
 At each step, determine if you've reached the destination.
 If yes, stop and output 'Final Answer: Finished!'.
+Use a strict stopping rule:
+- Stop only when the current viewpoint itself matches the final destination described in the instruction.
+- Do not stop just because you are in the correct room/area; stop only if the local landmark or final relation in the instruction is satisfied.
+- If the target room/object/landmark is visible but you are not yet clearly at the final position, continue moving closer.
+- If you have only completed an intermediate subgoal, do not stop yet.
 If not, continue by considering your location and the next viewpoint based on the instruction, using the action_maker tool.
 Show your reasoning in the Thought section.
 
@@ -277,4 +331,6 @@ Begin!
 
 Instruction: {action_plan}
 Initial Observation: {init_observation}
+Navigation History:
+{navigation_history}
 Thought: I should start navigation according to the instruction, {agent_scratchpad}"""

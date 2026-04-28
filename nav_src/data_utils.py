@@ -19,7 +19,7 @@ def construct_instrs(anno_dir, dataset, splits):
         return load_instr_datasets(anno_dir, dataset, splits)
 
     for i, item in enumerate(load_instr_datasets(anno_dir, dataset, splits)):
-        # Split multiple instructions into separate entries 
+        # Split multiple instructions into separate entries
         for j, instr in enumerate(item['instructions']):
             new_item = dict(item)
             new_item['instr_id'] = '%s_%d' % (item['path_id'], j)

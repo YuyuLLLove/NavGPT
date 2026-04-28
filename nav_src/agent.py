@@ -32,6 +32,7 @@ from langchain.agents.mrkl.prompt import FORMAT_INSTRUCTIONS
 from prompt.planner_prompt import (
     ACTION_PROMPT,
     HISTORY_PROMPT,
+    HISTORY_COMPRESS_PROMPT,
     PLANNER_PROMPT,
     BACK_TRACE_PROMPT,
     MAKE_ACTION_TOOL_NAME,
@@ -115,28 +116,44 @@ class NavGPTOutputParser(AgentOutputParser):
 class VLNAgent(ZeroShotAgent):
 
     history: Optional[List[str]] = None 
+    use_folded_history: bool = False
+    folded_history: Optional[str] = None
+    scratchpad_keep_recent_steps: int = 3
 
     def _construct_scratchpad(
         self, intermediate_steps: List[Tuple[AgentAction, str]]
     ) -> Union[str, List[BaseMessage]]:
         """Construct the scratchpad that lets the agent continue its thought process."""
         thoughts = ""
-        nav_step = 1
-        for i, (action, observation) in enumerate(intermediate_steps):
+        keep_recent = max(1, getattr(self, "scratchpad_keep_recent_steps", 3))
+        start_idx = max(0, len(intermediate_steps) - keep_recent)
+        nav_step = start_idx + 1
+        recent_steps = intermediate_steps[start_idx:]
+
+        for i, (action, observation) in enumerate(recent_steps):
             thoughts += action.log
-            if (i == len(intermediate_steps) - 1) or (action.tool != MAKE_ACTION_TOOL_NAME):
+            if (i == len(recent_steps) - 1) or (action.tool != MAKE_ACTION_TOOL_NAME):
                 thoughts += f"\n{self.observation_prefix}{observation}\n{self.llm_prefix}"
             else:
                 thoughts += f"\n{self.observation_prefix}{self.history[nav_step]}\n{self.llm_prefix}"
                 nav_step += 1
         return thoughts
 
+    def get_navigation_history_input(self) -> str:
+        if self.use_folded_history and self.folded_history:
+            return self.folded_history
+        return "No additional navigation history."
+
     def get_full_inputs(
         self, intermediate_steps: List[Tuple[AgentAction, str]], **kwargs: Any
     ) -> Dict[str, Any]:
         """Create the full inputs for the LLMChain from intermediate steps."""
         thoughts = self._construct_scratchpad(intermediate_steps)[-MAX_SCRATCHPAD_LENGTH:]
-        new_inputs = {"agent_scratchpad": thoughts, "stop": self._stop}
+        new_inputs = {
+            "agent_scratchpad": thoughts,
+            "navigation_history": self.get_navigation_history_input(),
+            "stop": self._stop,
+        }
         if len(intermediate_steps) == 0:
             full_inputs = {**kwargs, **new_inputs}
         else:
@@ -244,6 +261,134 @@ class NavAgent(BaseAgent):
         history = f'{angle}\nCurrent viewpoint "{obs["viewpoint"]}": Scene from the viewpoint is a {obs["obs_summary"]}'
         return history
 
+    def get_full_history(self) -> str:
+        """Return the full trajectory history for LLM context."""
+        if getattr(self.config, "history_fold_enable", False):
+            return self.format_folded_history()
+        history_list = getattr(self.agent_executor.agent, "history", None) or []
+        if not history_list:
+            return ""
+        return "\n\n".join(
+            [f"Step {idx + 1}:\n{item}" for idx, item in enumerate(history_list)]
+        )
+
+    def init_history_fold_state(self, initial_history: str):
+        """Initialize fold state for history compression."""
+        self.history_raw_steps = [initial_history]
+        self.history_steps = [
+            {
+                "start": 1,
+                "end": 1,
+                "content": initial_history,
+                "compressed": False,
+            }
+        ]
+        self.history_current_turn = 1
+        self.agent_executor.agent.history = [initial_history]
+
+    def format_folded_history(self) -> str:
+        """Format folded history to text consumed by LLM prompts."""
+        if not getattr(self, "history_steps", None):
+            return ""
+        step_strings = []
+        max_step = max(step["end"] for step in self.history_steps)
+        for step in sorted(self.history_steps, key=lambda x: x["start"]):
+            if step["start"] == step["end"]:
+                if step["end"] == max_step:
+                    header = f"Step {step['start']}:"
+                elif step.get("compressed", False):
+                    header = f"Compressed Step {step['start']}:"
+                else:
+                    header = f"Step {step['start']}:"
+            else:
+                header = f"Compressed Step {step['start']} to {step['end']}:"
+            step_strings.append(f"{header}\n{step['content']}")
+        return "\n\n".join(step_strings)
+
+    def _update_agent_history_cache(self):
+        """Update folded history cache without mutating pydantic agent fields."""
+        if getattr(self.config, "history_fold_enable", False):
+            folded_history = self.format_folded_history()
+            self._folded_history_cache = folded_history
+            self.agent_executor.agent.folded_history = folded_history
+
+    def append_history_step(self, step_content: str):
+        """Append one new raw step and keep folded state updated."""
+        self.history_current_turn += 1
+        step_id = self.history_current_turn
+        self.history_raw_steps.append(step_content)
+        self.agent_executor.agent.history.append(step_content)
+        self.history_steps.append(
+            {
+                "start": step_id,
+                "end": step_id,
+                "content": step_content,
+                "compressed": False,
+            }
+        )
+
+    def should_compress_history(self) -> bool:
+        """Check whether history compression should trigger."""
+        if not getattr(self.config, "history_fold_enable", False):
+            return False
+        unfolded_steps = [s for s in self.history_steps if s["start"] == s["end"]]
+        if len(unfolded_steps) < getattr(self.config, "history_fold_step_threshold", 4):
+            if len(self.format_folded_history()) < getattr(self.config, "history_fold_char_threshold", 3500):
+                return False
+        return True
+
+    def _extract_json_object(self, text: str) -> str:
+        """Extract first JSON object from model output text."""
+        text = text.strip()
+        if text.startswith("{") and text.endswith("}"):
+            return text
+        match = re.search(r"\{.*\}", text, re.DOTALL)
+        if match:
+            return match.group(0)
+        raise ValueError("No JSON object found in compression output.")
+
+    def compress_history_steps(self, action_plan: str, new_step: str):
+        """Compress old history steps with model output and safe fallback."""
+        keep_recent = max(1, getattr(self.config, "history_keep_recent_steps", 2))
+        if len(self.history_steps) <= keep_recent:
+            return
+        previous_steps = self.format_folded_history()
+        llm_output = self.history_compress_chain.run(
+            action_plan=action_plan,
+            previous_steps=previous_steps,
+            new_step=new_step,
+            keep_recent_steps=keep_recent,
+        )
+        payload = json.loads(self._extract_json_object(llm_output))
+        compress_range = payload.get("compress_range", [])
+        compress_text = (payload.get("compress_text", "") or "").strip()
+        if not compress_range or not compress_text:
+            return
+        if not isinstance(compress_range, list) or not all(isinstance(i, int) for i in compress_range):
+            return
+        start_step = min(compress_range)
+        end_step = max(compress_range)
+        latest = self.history_current_turn
+        if end_step >= latest - keep_recent + 1:
+            return
+        if start_step < 1 or end_step < start_step:
+            return
+        if len(compress_text) < 20:
+            return
+        remaining_steps = [
+            step for step in self.history_steps
+            if step["end"] < start_step or step["start"] > end_step
+        ]
+        remaining_steps.append(
+            {
+                "start": start_step,
+                "end": end_step,
+                "content": compress_text,
+                "compressed": True,
+            }
+        )
+        self.history_steps = sorted(remaining_steps, key=lambda x: x["start"])
+
     def get_navigable_str(self, cur_heading: float, cur_elevation: float, navigable: dict) -> str:
         '''Return the navigable viewpoints as a string.'''
         navigable_str = ''
@@ -349,7 +494,15 @@ class NavAgent(BaseAgent):
             'details': [],
         } for ob in obs]
         # Record the history of actions taken
-        self.agent_executor.agent.history = [f'Navigation start, no actions taken yet.\nCurrent viewpoint "{obs[0]["viewpoint"]}": Scene from the viewpoint is a {obs[0]["obs_summary"]}']
+        init_history = (
+            f'Navigation start, no actions taken yet.\nCurrent viewpoint "{obs[0]["viewpoint"]}": '
+            f'Scene from the viewpoint is a {obs[0]["obs_summary"]}'
+        )
+        if getattr(self.config, "history_fold_enable", False):
+            self.init_history_fold_state(init_history)
+            self._update_agent_history_cache()
+        else:
+            self.agent_executor.agent.history = [init_history]
 
     def _create_make_action_tool(
             self,
@@ -374,6 +527,11 @@ class NavAgent(BaseAgent):
         )
         self.action_chain = LLMChain(llm=llm, prompt=action_prompt)
         self.history_chain = LLMChain(llm=llm, prompt=history_prompt)
+        compress_prompt = PromptTemplate(
+            template=HISTORY_COMPRESS_PROMPT,
+            input_variables=["action_plan", "previous_steps", "new_step", "keep_recent_steps"],
+        )
+        self.history_compress_chain = LLMChain(llm=llm, prompt=compress_prompt)
 
         def _make_action(*args, **kwargs) -> str:
             '''Make single step action in MatterSim.'''
@@ -399,7 +557,7 @@ class NavAgent(BaseAgent):
                 LLM_action_output = self.action_chain.run(
                     action_plan = action_plan, 
                     observation = feature, 
-                    history = self.agent_executor.agent.history[-1], 
+                    history = self.get_full_history(),
                     navigable_viewpoints = navigable
                 )
                 # Parse LLM output, action is the next viewpoint ID
@@ -411,7 +569,11 @@ class NavAgent(BaseAgent):
             if action not in self.env.env.sims[0].navigable_dict.keys():
                 # Update history
                 history = f'ViewpointID "{action}" is not valid, no action taken for the agent.'
-                self.agent_executor.agent.history.append(history)
+                if getattr(self.config, "history_fold_enable", False):
+                    self.append_history_step(history)
+                    self._update_agent_history_cache()
+                else:
+                    self.agent_executor.agent.history.append(history)
                 if self.config.use_navigable:
                     return f"\nViewpointID '{action}' is not valid, agent not moved. DO NOT fabricate nonexistent IDs. The navigable viewpoints you can choose from current viewpoints are: {[key for key in navigable.keys()]}.\n\tCurrent Viewpoint:\n{feature}\n\tNavigable Viewpoints:\n{navigable}"
                 else:
@@ -436,13 +598,25 @@ class NavAgent(BaseAgent):
             if self.config.use_history_chain:
                 history = self.history_chain.run(
                     observation = new_feature_sum, 
-                    history = self.agent_executor.agent.history[-1], 
+                    history = self.get_full_history(),
                     previous_action = turned_angle
                 )
             else:
                 history = self.get_history(new_obs, turned_angle)
-            
-            self.agent_executor.agent.history.append(history)
+
+            if getattr(self.config, "history_fold_enable", False):
+                self.append_history_step(history)
+                if self.should_compress_history():
+                    try:
+                        self.compress_history_steps(self.cur_action_plan, history)
+                    except Exception:
+                        warnings.warn(
+                            "History compression failed; fallback to uncompressed history for this step.",
+                            RuntimeWarning,
+                        )
+                self._update_agent_history_cache()
+            else:
+                self.agent_executor.agent.history.append(history)
             # Record single step detail
             if self.config.use_tool_chain:
                 detail = {
@@ -450,14 +624,14 @@ class NavAgent(BaseAgent):
                     "turned_angle": turned_angle,
                     "acion_maker_thought": thought,
                     "feature": new_feature,
-                    "history": self.agent_executor.agent.history[-1],
+                    "history": self.get_full_history(),
                 }
             else:
                 detail = {
                     "viewpointID": action,
                     "turned_angle": turned_angle,
                     "feature": new_feature,
-                    "history": self.agent_executor.agent.history[-1],
+                    "history": self.get_full_history(),
                 }
             self.traj[0]['details'].append(detail)
             # Return LLM chain output as the observation of tool
@@ -519,7 +693,7 @@ class NavAgent(BaseAgent):
                 # Get all previous viewpoints observation
                 previous_vp = self.get_his_viewpoints()
                 # Back trace
-                LLM_output = chain.run(action_plan = action_plan, observation = previous_vp, history = self.agent_executor.agent.history[-1])
+                LLM_output = chain.run(action_plan = action_plan, observation = previous_vp, history = self.get_full_history())
                 # Parse LLM output, action is the next viewpoint ID
                 thought, action = self.parse_action(LLM_output)
             else:
@@ -548,7 +722,19 @@ class NavAgent(BaseAgent):
 
             # Update history
             history = self.get_history(new_obs, 'Seems going in a wrong way, back trace to a previous point.')
-            self.agent_executor.agent.history.append(history)
+            if getattr(self.config, "history_fold_enable", False):
+                self.append_history_step(history)
+                if self.should_compress_history():
+                    try:
+                        self.compress_history_steps(self.cur_action_plan, history)
+                    except Exception:
+                        warnings.warn(
+                            "History compression failed during back trace; fallback to uncompressed history.",
+                            RuntimeWarning,
+                        )
+                self._update_agent_history_cache()
+            else:
+                self.agent_executor.agent.history.append(history)
             # Record single step detail
             if self.config.use_tool_chain:
                 return f"\tBack_tracer Thought:\n{thought}\n\tCurrent Viewpoint:\n{new_feature}\n\tNavigable Viewpoints:\n{new_navigable}"
@@ -590,7 +776,7 @@ class NavAgent(BaseAgent):
         if self.config.use_tool_chain:
             prompt = PromptTemplate(
                 template=VLN_ORCHESTRATOR_PROMPT,
-                input_variables=["action_plan", "init_observation", "observation", "agent_scratchpad"],
+                input_variables=["action_plan", "init_observation", "observation", "navigation_history", "agent_scratchpad"],
                 partial_variables={
                     "tool_names": ", ".join([tool.name for tool in tools]),
                     "tool_descriptions": "\n".join(
@@ -602,7 +788,7 @@ class NavAgent(BaseAgent):
             tools = [self.action_maker]
             prompt = PromptTemplate(
                 template=VLN_GPT4_PROMPT if self.config.llm_model_name == 'gpt-4' else VLN_GPT35_PROMPT,
-                input_variables=["action_plan", "init_observation", "agent_scratchpad"],
+                input_variables=["action_plan", "init_observation", "navigation_history", "agent_scratchpad"],
                 partial_variables={
                     "tool_names": ", ".join([tool.name for tool in tools]),
                     "tool_descriptions": "\n".join(
@@ -613,7 +799,7 @@ class NavAgent(BaseAgent):
         else:
             prompt = PromptTemplate(
                 template=VLN_ORCHESTRATOR_PROMPT,
-                input_variables=["action_plan", "init_observation", "agent_scratchpad"],
+                input_variables=["action_plan", "init_observation", "navigation_history", "agent_scratchpad"],
                 partial_variables={
                     "tool_names": ", ".join([tool.name for tool in tools]),
                     "tool_descriptions": "\n".join(
@@ -624,7 +810,9 @@ class NavAgent(BaseAgent):
         agent = VLNAgent(
             llm_chain=LLMChain(llm=self.llm, prompt=prompt),
             allowed_tools=[tool.name for tool in tools],
-            output_parser = self.output_parser
+            output_parser = self.output_parser,
+            use_folded_history=getattr(self.config, "history_fold_enable", False),
+            scratchpad_keep_recent_steps=getattr(self.config, "scratchpad_keep_recent_steps", 3),
         )
         return AgentExecutor.from_agent_and_tools(
             agent=agent, 
@@ -698,6 +886,7 @@ class NavAgent(BaseAgent):
                     'action_plan': self.cur_action_plan,
                     'init_observation': init_ob['obs_summary'],
                     'observation': first_obs,
+                    'navigation_history': self.agent_executor.agent.get_navigation_history_input(),
                 }
             else:
                 # Get current feature
@@ -726,6 +915,7 @@ class NavAgent(BaseAgent):
                 input = {
                     'action_plan': self.cur_action_plan,
                     'init_observation': init_observation,
+                    'navigation_history': self.agent_executor.agent.get_navigation_history_input(),
                 }
             output = self.agent_executor(input)
 

@@ -60,6 +60,11 @@ def parse_args():
     parser.add_argument('--use_tool_chain', action='store_true', default=False)
     parser.add_argument('--use_navigable', action='store_true', default=False)
     parser.add_argument('--use_single_action', action='store_true', default=True)
+    parser.add_argument('--history_fold_enable', action='store_true', default=True)
+    parser.add_argument('--history_fold_step_threshold', type=int, default=10)
+    parser.add_argument('--history_fold_char_threshold', type=int, default=3500)
+    parser.add_argument('--history_keep_recent_steps', type=int, default=3)
+    parser.add_argument('--scratchpad_keep_recent_steps', type=int, default=6)
 
     parser.add_argument('--detailed_output', action='store_true', default=True)
 
@@ -111,4 +116,3 @@ def postprocess_args(args):
     args.api_base = base
 
     return args
-
